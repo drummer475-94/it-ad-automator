@@ -18,10 +18,10 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
-      - name: Test and enforce 90% command coverage
+      - name: Test and enforce greater than 90% command coverage
         shell: pwsh
         run: |
           $result = Invoke-Pester -Path ./powershell/Tests -CodeCoverage ./powershell/Modules/*.psm1 -PassThru
           $coverage = 100 * $result.CodeCoverage.NumberOfCommandsExecuted / $result.CodeCoverage.NumberOfCommandsAnalyzed
           Write-Host ('Command coverage: {0:N2}%' -f $coverage)
-          if ($result.FailedCount -gt 0 -or $coverage -lt 90) { exit 1 }
+          if ($result.FailedCount -gt 0 -or $coverage -le 90) { exit 1 }

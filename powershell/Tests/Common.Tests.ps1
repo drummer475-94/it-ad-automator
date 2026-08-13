@@ -15,6 +15,11 @@ Describe 'Common security helpers' {
         Get-ADCredentialFromEnv | Should Be $null
     }
 
+    It 'fails closed when a named credential is requested without SecretManagement' {
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq 'Get-Secret' }
+        { Get-ADCredentialFromEnv -CredentialName 'missing-test-secret' } | Should Throw
+    }
+
     It 'rejects missing and empty intake files' {
         { Test-IntakeJsonSchema -IntakeJsonPath (Join-Path $env:TEMP 'does-not-exist-itad.json') } | Should Throw
         $emptyPath = Join-Path $env:TEMP 'empty-itad.json'

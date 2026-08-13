@@ -1,7 +1,7 @@
 # IT AD Automator
 
 [![PowerShell tests](https://github.com/drummer475-94/it-ad-automator/actions/workflows/test.yml/badge.svg)](https://github.com/drummer475-94/it-ad-automator/actions/workflows/test.yml)
-[![Coverage](https://img.shields.io/badge/coverage-90%25%2B-brightgreen)](https://github.com/drummer475-94/it-ad-automator/actions/workflows/test.yml)
+[![Coverage](https://img.shields.io/badge/command%20coverage-%3E90%25-brightgreen)](https://github.com/drummer475-94/it-ad-automator/actions/workflows/test.yml)
 [![PowerShell](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell)](https://learn.microsoft.com/powershell/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -63,7 +63,7 @@ $coverage = 100 * $result.CodeCoverage.NumberOfCommandsExecuted / $result.CodeCo
 'Coverage: {0:N2}%' -f $coverage
 ```
 
-The current suite contains 22 offline-safe tests. CI runs the compatibility suite with Pester 4.10.1 on PowerShell 7, calculates command coverage on every change, and fails below 90%.
+The current suite contains 23 offline-safe tests. CI runs the compatibility suite with Pester 4.10.1 on PowerShell 7, calculates command coverage on every change, and requires greater than 90%.
 
 ## License
 
