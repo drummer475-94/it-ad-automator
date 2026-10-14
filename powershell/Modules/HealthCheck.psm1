@@ -14,7 +14,7 @@ function Invoke-ADHealthCheck {
         [int]$InactiveThresholdDays = 90,
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [scriptblock]$DnsResolver,
@@ -50,9 +50,15 @@ function Invoke-ADHealthCheck {
 
             try {
                 $conn = if ($ConnectionTester) { & $ConnectionTester $dc } else { Test-Connection -ComputerName $dc -Count 1 -ErrorAction Stop }
-                if ($conn) {
-                    $pingSuccess = $true
-                    $latencyMs = if ($conn.ResponseTime) { $conn.ResponseTime } else { 0 }
+                $reply = @($conn)[0]
+                # PowerShell 7 returns a PingStatus with Status/Latency even when the host is unreachable;
+                # Windows PowerShell returns Win32_PingStatus with StatusCode/ResponseTime.
+                $pingSuccess = if ($null -eq $reply) { $false }
+                    elseif ($null -ne $reply.Status) { "$($reply.Status)" -eq 'Success' }
+                    elseif ($null -ne $reply.StatusCode) { $reply.StatusCode -eq 0 }
+                    else { $true }
+                if ($pingSuccess) {
+                    $latencyMs = if ($null -ne $reply.Latency) { $reply.Latency } elseif ($null -ne $reply.ResponseTime) { $reply.ResponseTime } else { 0 }
                 }
             }
             catch {
@@ -100,21 +106,24 @@ function Invoke-ADHealthCheck {
 
         # Step 3: Check tombstone/inactive accounts > Threshold Days
         $inactiveUsers = @()
+        $inactiveSearchSucceeded = $true
         try {
             if ($InactiveAccountSearcher) {
                 $inactiveUsers = @(& $InactiveAccountSearcher $InactiveThresholdDays)
             }
             else {
                 $timeSpan = New-TimeSpan -Days $InactiveThresholdDays
-                $inactiveUsers = Search-ADAccount -AccountInactive -TimeSpan $timeSpan -UserOnly -ErrorAction Stop
+                $inactiveUsers = @(Search-ADAccount -AccountInactive -TimeSpan $timeSpan -UsersOnly -Server $Domain -ErrorAction Stop)
             }
         }
         catch {
-            Write-Verbose "Search-ADAccount call failed or domain unreachable; defaulting to empty list."
+            # A failed search is not evidence of zero inactive accounts; surface it instead of reporting Healthy.
+            $inactiveSearchSucceeded = $false
             $inactiveUsers = @()
+            $findings += "Inactive account search failed; inactive account count is unknown: $($_.Exception.Message)"
         }
 
-        $inactiveCount = if ($inactiveUsers) { $inactiveUsers.Count } else { 0 }
+        $inactiveCount = $inactiveUsers.Count
         if ($inactiveCount -gt 0) {
             $findings += "Found $inactiveCount inactive AD user accounts with no activity in over $InactiveThresholdDays days."
         }
@@ -127,7 +136,7 @@ function Invoke-ADHealthCheck {
         if ($unhealthyDCs -gt 0 -or $offlineSysvols -gt 0) {
             $overallHealth = "Critical"
         }
-        elseif ($inactiveCount -gt 0) {
+        elseif ($inactiveCount -gt 0 -or -not $inactiveSearchSucceeded) {
             $overallHealth = "Warning"
         }
 
@@ -138,12 +147,14 @@ function Invoke-ADHealthCheck {
             DCHealth             = $dcHealth
             SYSVOLStatus         = $sysvolStatus
             InactiveAccountCount = $inactiveCount
+            InactiveSearchStatus = if ($inactiveSearchSucceeded) { "Succeeded" } else { "Failed" }
             Findings             = $findings
         }
 
         # Write audit log entry (suppress output from pipeline)
         $null = Write-ADAuditLog -Action "Invoke-ADHealthCheck" -Target $Domain -Status $overallHealth -Details @{
             InactiveAccountCount = $inactiveCount
+            InactiveSearchStatus = $healthReport.InactiveSearchStatus
             UnhealthyDCs         = $unhealthyDCs
             OfflineSysvols       = $offlineSysvols
         } -LogPath $LogPath

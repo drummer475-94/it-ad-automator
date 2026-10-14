@@ -1,6 +1,60 @@
 # GPOAudit.psm1 - Active Directory Group Policy Audit & Security Scanner
 # Part of ITADAutomator PowerShell Suite
 
+function Get-LegacyProtocolSetting {
+    # Returns a description for each NTLMv1/LM or SMBv1 setting configured in a SYSVOL policy file.
+    # Covers Security Settings (GptTmpl.inf) and Group Policy Preferences registry items (*.xml).
+    # LmCompatibilityLevel 0-2 still sends LM/NTLMv1 responses; 3 or higher is NTLMv2-only.
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    $settings = @()
+
+    if ($File.Extension -eq '.inf') {
+        $lmMatch = [regex]::Match($Content, '(?im)^\s*MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\LmCompatibilityLevel\s*=\s*\d+\s*,\s*(\d+)\s*$')
+        if ($lmMatch.Success -and [int]$lmMatch.Groups[1].Value -lt 3) {
+            $settings += "LmCompatibilityLevel=$($lmMatch.Groups[1].Value) permits LM/NTLMv1"
+        }
+        $smbMatch = [regex]::Match($Content, '(?im)^\s*MACHINE\\System\\CurrentControlSet\\Services\\LanmanServer\\Parameters\\SMB1\s*=\s*\d+\s*,\s*(\d+)\s*$')
+        if ($smbMatch.Success -and [int]$smbMatch.Groups[1].Value -ne 0) {
+            $settings += "SMB1=$($smbMatch.Groups[1].Value) enables the SMBv1 server"
+        }
+        return $settings
+    }
+
+    try {
+        $xml = [xml]$Content
+    }
+    catch {
+        return $settings
+    }
+
+    foreach ($item in @($xml.SelectNodes('//Properties[@name]'))) {
+        if ($item.GetAttribute('action') -eq 'D') { continue }
+        $rawValue = $item.GetAttribute('value')
+        if ([string]::IsNullOrWhiteSpace($rawValue)) { continue }
+        # GPP stores REG_DWORD values as hexadecimal strings, e.g. "00000005".
+        $value = if ($item.GetAttribute('type') -eq 'REG_DWORD') { [Convert]::ToInt64($rawValue, 16) } else { $rawValue -as [long] }
+        if ($null -eq $value) { continue }
+
+        $name = $item.GetAttribute('name')
+        $key = $item.GetAttribute('key')
+        if ($name -eq 'LmCompatibilityLevel' -and $key -match '\\Control\\Lsa$' -and $value -lt 3) {
+            $settings += "LmCompatibilityLevel=$value permits LM/NTLMv1"
+        }
+        elseif ($name -eq 'SMB1' -and $key -match '\\LanmanServer\\Parameters$' -and $value -ne 0) {
+            $settings += "SMB1=$value enables the SMBv1 server"
+        }
+    }
+
+    return $settings
+}
+
 function Get-GPOAuditReport {
     [CmdletBinding()]
     param(
@@ -14,24 +68,26 @@ function Get-GPOAuditReport {
         [string]$OutputPath = "gpo_audit_report.json",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json"
+        [string]$LogPath
     )
 
     process {
         $findings = @()
+        $scanErrors = @()
         $gpos = @()
 
         # Step 1: Retrieve GPOs (mockable via Get-GPO -All)
         try {
-            $gpos = Get-GPO -All -Domain $Domain -ErrorAction Stop
+            $gpos = @(Get-GPO -All -Domain $Domain -ErrorAction Stop)
         }
         catch {
-            Write-Verbose "Get-GPO -All call failed or domain not reached; generating simulated/scanned findings."
+            # An unreachable domain is not a clean domain; record it so the report cannot read as Passed.
+            $scanErrors += "Get-GPO failed for domain '$Domain': $($_.Exception.Message)"
             $gpos = @()
         }
 
         # Step 2: Analyze GPOs
-        $scannedCount = if ($gpos) { $gpos.Count } else { 0 }
+        $scannedCount = $gpos.Count
 
         if ($gpos) {
             foreach ($gpo in $gpos) {
@@ -40,7 +96,7 @@ function Get-GPOAuditReport {
 
                 # Check 1: Unlinked GPO detection
                 try {
-                    $reportXml = Get-GPOReport -Guid $gpoId -ReportType Xml -ErrorAction Stop
+                    $reportXml = Get-GPOReport -Guid $gpoId -ReportType Xml -Domain $Domain -ErrorAction Stop
                     if ($reportXml) {
                         $reportObjXml = [xml]$reportXml
 
@@ -78,7 +134,7 @@ function Get-GPOAuditReport {
                     }
                 }
                 catch {
-                    Write-Verbose "Could not analyze GPO XML report for $gpoName."
+                    $scanErrors += "Could not analyze GPO report for '$gpoName': $($_.Exception.Message)"
                 }
             }
         }
@@ -87,46 +143,61 @@ function Get-GPOAuditReport {
         $targetSysvol = if ($SysvolPath) { $SysvolPath } else { "\\$Domain\sysvol\$Domain\Policies" }
         
         if (Test-Path -Path $targetSysvol) {
-            # Search for Groups.xml or cpassword in SYSVOL
-            $xmlFiles = Get-ChildItem -Path $targetSysvol -Recurse -Filter "*.xml" -ErrorAction SilentlyContinue
-            if ($xmlFiles) {
-                foreach ($file in $xmlFiles) {
-                    try {
-                        $content = Get-Content -Path $file.FullName -Raw -ErrorAction SilentlyContinue
-                        if ($content -and $content -match 'cpassword\s*=\s*"[^"]+"') {
-                            $findings += [PSCustomObject]@{
-                                GPOName     = $file.Directory.Name
-                                GPOId       = $file.FullName
-                                Category    = "CPasswordSecret"
-                                Severity    = "Critical"
-                                Description = "Hardcoded MS14-025 cpassword secret detected in Group Policy XML file: $($file.Name)."
-                                Remediation = "Remove Group Policy Preferences password and deploy LAPS."
-                            }
-                        }
+            # Search policy XML (Group Policy Preferences) and GptTmpl.inf (Security Settings) files
+            $policyFiles = @(Get-ChildItem -Path $targetSysvol -Recurse -File -Include '*.xml', '*.inf' -ErrorAction SilentlyContinue -ErrorVariable sysvolErrors)
+            foreach ($sysvolError in $sysvolErrors) {
+                $scanErrors += "SYSVOL enumeration error: $($sysvolError.Exception.Message)"
+            }
+            foreach ($file in $policyFiles) {
+                try {
+                    $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+                    if (-not $content) { continue }
 
-                        # Legacy SMBv1 / NTLMv1 check
-                        if ($content -and ($content -match 'LmCompatibilityLevel.*[0-2]' -or $content -match 'SMB1.*Enabled.*1')) {
-                            $findings += [PSCustomObject]@{
-                                GPOName     = $file.Directory.Name
-                                GPOId       = $file.FullName
-                                Category    = "LegacyProtocolSettings"
-                                Severity    = "Medium"
-                                Description = "Legacy SMBv1 or NTLMv1 authentication settings configured in GPO policy."
-                                Remediation = "Upgrade authentication level to NTLMv2 minimum and enforce SMBv2/v3."
-                            }
+                    # Policy files live under Policies\{GPO-GUID}\...; name the owning GPO, not the leaf folder.
+                    $guidFolder = $file.FullName -split '[\\/]' | Where-Object { $_ -match '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$' } | Select-Object -Last 1
+                    $fileGpoId = if ($guidFolder) { $guidFolder.Trim('{', '}') } else { $null }
+                    $owningGpo = if ($fileGpoId) { $gpos | Where-Object { "$($_.Id)" -eq $fileGpoId } | Select-Object -First 1 } else { $null }
+                    $fileGpoName = if ($owningGpo) { $owningGpo.DisplayName } elseif ($fileGpoId) { $fileGpoId } else { $file.Directory.Name }
+
+                    if ($file.Extension -eq '.xml' -and $content -match 'cpassword\s*=\s*("[^"]+"|''[^'']+'')') {
+                        $findings += [PSCustomObject]@{
+                            GPOName     = $fileGpoName
+                            GPOId       = $fileGpoId
+                            FilePath    = $file.FullName
+                            Category    = "CPasswordSecret"
+                            Severity    = "Critical"
+                            Description = "Hardcoded MS14-025 cpassword secret detected in Group Policy XML file: $($file.Name)."
+                            Remediation = "Remove Group Policy Preferences password and deploy LAPS."
                         }
                     }
-                    catch {
-                        Write-Verbose "Error scanning SYSVOL file $($file.FullName): $_"
+
+                    # Legacy SMBv1 / NTLMv1 check
+                    $legacySettings = @(Get-LegacyProtocolSetting -File $file -Content $content)
+                    if ($legacySettings.Count -gt 0) {
+                        $findings += [PSCustomObject]@{
+                            GPOName     = $fileGpoName
+                            GPOId       = $fileGpoId
+                            FilePath    = $file.FullName
+                            Category    = "LegacyProtocolSettings"
+                            Severity    = "High"
+                            Description = "Legacy protocol settings configured in $($file.Name): $($legacySettings -join '; ')."
+                            Remediation = "Set LmCompatibilityLevel to 5 (NTLMv2 only) and disable SMBv1."
+                        }
                     }
                 }
+                catch {
+                    $scanErrors += "Could not scan SYSVOL file $($file.FullName): $($_.Exception.Message)"
+                }
             }
+        }
+        else {
+            $scanErrors += "SYSVOL path '$targetSysvol' is not accessible; cpassword and legacy protocol checks did not run."
         }
 
         # Format output summary & report
         $hasCritical = ($findings | Where-Object { $_.Severity -eq "Critical" }).Count -gt 0
         $hasHigh = ($findings | Where-Object { $_.Severity -eq "High" }).Count -gt 0
-        $complianceStatus = if ($hasCritical -or $hasHigh) { "NonCompliant" } else { "Passed" }
+        $complianceStatus = if ($hasCritical -or $hasHigh) { "NonCompliant" } elseif ($scanErrors.Count -gt 0) { "Incomplete" } else { "Passed" }
 
         $reportObj = [PSCustomObject]@{
             Domain            = $Domain
@@ -135,6 +206,7 @@ function Get-GPOAuditReport {
             ComplianceStatus  = $complianceStatus
             TotalFindings     = $findings.Count
             Findings          = $findings
+            ScanErrors        = $scanErrors
         }
 
         # Write output JSON
@@ -150,6 +222,7 @@ function Get-GPOAuditReport {
         $null = Write-ADAuditLog -Action "Get-GPOAuditReport" -Target $Domain -Status $complianceStatus -Details @{
             ScannedGPOCount = $scannedCount
             TotalFindings   = $findings.Count
+            ScanErrorCount  = $scanErrors.Count
             OutputPath      = $OutputPath
         } -LogPath $LogPath
 

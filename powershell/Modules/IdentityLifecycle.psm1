@@ -1,6 +1,30 @@
 # IdentityLifecycle.psm1 - Active Directory User Onboarding, Offboarding & Role Adjustments
 # Part of ITADAutomator PowerShell Suite
 
+# Department -> baseline access group. Onboarding and role changes both use this map so a transfer
+# grants exactly what a new hire in that department would get.
+$script:DepartmentGroupMap = @{
+    'Engineering'      = 'GRP-ENG-Baseline'
+    'Software'         = 'GRP-ENG-Baseline'
+    'HR'               = 'GRP-HR-Baseline'
+    'Human Resources'  = 'GRP-HR-Baseline'
+    'Finance'          = 'GRP-FIN-Baseline'
+    'Accounting'       = 'GRP-FIN-Baseline'
+    'Sales'            = 'GRP-SALES-Baseline'
+    'Marketing'        = 'GRP-SALES-Baseline'
+    'IT'               = 'GRP-IT-Baseline'
+}
+$script:DefaultBaselineGroup = 'GRP-Domain-Users-Baseline'
+
+function Get-DepartmentBaselineGroup {
+    param([string]$Department)
+
+    if ($Department -and $script:DepartmentGroupMap.ContainsKey($Department)) {
+        return $script:DepartmentGroupMap[$Department]
+    }
+    return $script:DefaultBaselineGroup
+}
+
 function Revoke-ADUserSession {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -46,7 +70,7 @@ function New-ADUserAutomated {
         [string]$BaseOU = "OU=Users,OU=CORP,DC=corp,DC=local",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential,
@@ -61,36 +85,37 @@ function New-ADUserAutomated {
 
         $cleanFirst = $intake.FirstName -replace '[^a-zA-Z0-9]', ''
         $cleanLast  = $intake.LastName  -replace '[^a-zA-Z0-9]', ''
+        if ([string]::IsNullOrEmpty($cleanFirst) -or [string]::IsNullOrEmpty($cleanLast)) {
+            throw "Name '$($intake.FirstName) $($intake.LastName)' contains no ASCII letters or digits in the first or last name; an account name cannot be derived. Create this account manually."
+        }
 
         $upn = "$($cleanFirst.ToLower()).$($cleanLast.ToLower())@$DomainName"
 
-        $firstInitial = if ($cleanFirst.Length -gt 0) { $cleanFirst.Substring(0,1).ToLower() } else { "u" }
+        $firstInitial = $cleanFirst.Substring(0,1).ToLower()
         $sam = "$firstInitial$($cleanLast.ToLower())"
         if ($sam.Length -gt 20) {
             $sam = $sam.Substring(0, 20)
         }
 
         # Determine department baseline group
-        $deptGroupMap = @{
-            'Engineering'      = 'GRP-ENG-Baseline'
-            'Software'         = 'GRP-ENG-Baseline'
-            'HR'               = 'GRP-HR-Baseline'
-            'Human Resources'  = 'GRP-HR-Baseline'
-            'Finance'          = 'GRP-FIN-Baseline'
-            'Accounting'       = 'GRP-FIN-Baseline'
-            'Sales'            = 'GRP-SALES-Baseline'
-            'Marketing'        = 'GRP-SALES-Baseline'
-            'IT'               = 'GRP-IT-Baseline'
-        }
-
-        $baselineGroup = "GRP-Domain-Users-Baseline"
-        if ($deptGroupMap.ContainsKey($intake.Department)) {
-            $baselineGroup = $deptGroupMap[$intake.Department]
-        }
+        $baselineGroup = Get-DepartmentBaselineGroup -Department $intake.Department
 
         if ($PSCmdlet.ShouldProcess($upn, "Create AD User account ($sam) and assign to $baselineGroup")) {
             if (-not $InitialPassword) {
                 throw "InitialPassword is required for account creation. Pass a SecureString; passwords are never read from intake JSON or stored in source."
+            }
+
+            # Refuse to continue when the derived names already belong to someone else; otherwise the
+            # baseline group grant below would land on the existing account.
+            $escapedUpn = $upn -replace "'", "''"
+            $lookupParams = @{
+                Filter      = "SamAccountName -eq '$sam' -or UserPrincipalName -eq '$escapedUpn'"
+                ErrorAction = 'Stop'
+            }
+            if ($Credential) { $lookupParams['Credential'] = $Credential }
+            $existing = @(Get-ADUser @lookupParams)
+            if ($existing.Count -gt 0) {
+                throw "An AD account already uses SamAccountName '$sam' or UserPrincipalName '$upn'. Resolve the naming collision manually; no changes were made."
             }
 
             $adUserParams = @{
@@ -105,6 +130,7 @@ function New-ADUserAutomated {
                 Path               = $BaseOU
                 Enabled            = $true
                 AccountPassword    = $InitialPassword
+                ErrorAction        = 'Stop'
             }
 
             if ($Credential) {
@@ -116,13 +142,24 @@ function New-ADUserAutomated {
 
             # Assign baseline group
             $groupParams = @{
-                Identity = $baselineGroup
-                Members  = $sam
+                Identity    = $baselineGroup
+                Members     = $sam
+                ErrorAction = 'Stop'
             }
             if ($Credential) {
                 $groupParams['Credential'] = $Credential
             }
-            $null = Add-ADGroupMember @groupParams
+            try {
+                $null = Add-ADGroupMember @groupParams
+            }
+            catch {
+                $null = Write-ADAuditLog -Action "New-ADUserAutomated" -Target $upn -Status "CreatedGroupAssignmentFailed" -Details @{
+                    SamAccountName = $sam
+                    BaselineGroup  = $baselineGroup
+                    Error          = $_.Exception.Message
+                } -LogPath $LogPath
+                throw "Account '$sam' was created but could not be added to '$baselineGroup': $($_.Exception.Message)"
+            }
 
             $auditLog = Write-ADAuditLog -Action "New-ADUserAutomated" -Target $upn -Status "Created" -Details @{
                 SamAccountName = $sam
@@ -166,7 +203,7 @@ function Disable-ADUserOffboard {
         [switch]$ArchiveProfile,
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential,
@@ -177,58 +214,110 @@ function Disable-ADUserOffboard {
 
     process {
         if ($PSCmdlet.ShouldProcess($Identity, "Offboard AD user (revoke sessions, strip security groups, disable account)")) {
-            # 1. Revoke sessions
-            $sessionRevoked = Revoke-ADUserSession -Identity $Identity -RevocationHandler $SessionRevocationHandler
+            # Resolve the account first so a bad identity fails before anything is changed, and so the
+            # cloud session provider receives the UPN rather than an on-premises SamAccountName or DN.
+            $getUserParams = @{ Identity = $Identity; Properties = @('UserPrincipalName'); ErrorAction = 'Stop' }
+            if ($Credential) { $getUserParams['Credential'] = $Credential }
+            $adUser = Get-ADUser @getUserParams
+            $sessionIdentity = if ($adUser.UserPrincipalName) { $adUser.UserPrincipalName } else { $Identity }
+
+            $errors = @()
+
+            # 1. Revoke sessions. A provider failure must not stop the account from being disabled.
+            $sessionRevoked = $false
+            try {
+                $sessionRevoked = [bool](Revoke-ADUserSession -Identity $sessionIdentity -RevocationHandler $SessionRevocationHandler)
+            }
+            catch {
+                $errors += "Session revocation failed: $($_.Exception.Message)"
+            }
 
             # 2. Get group memberships & strip security/distribution groups
-            $getGroupParams = @{ Identity = $Identity }
+            $getGroupParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
             if ($Credential) { $getGroupParams['Credential'] = $Credential }
 
-            $userGroups = Get-ADPrincipalGroupMembership @getGroupParams
-            $removedGroups = @()
+            $userGroups = @()
+            try {
+                $userGroups = @(Get-ADPrincipalGroupMembership @getGroupParams)
+            }
+            catch {
+                $errors += "Group membership lookup failed: $($_.Exception.Message)"
+            }
 
-            if ($userGroups) {
-                foreach ($group in $userGroups) {
-                    # Skip primary group (Domain Users / SID ending in 513)
-                    if ($group.Name -ne 'Domain Users' -and $group.GroupScope -ne 'Primary') {
-                        $removeGroupParams = @{
-                            Identity = $group.SamAccountName
-                            Members  = $Identity
-                            Confirm  = $false
-                        }
-                        if ($Credential) { $removeGroupParams['Credential'] = $Credential }
+            $removedGroups = @()
+            $failedGroups = @()
+            foreach ($group in $userGroups) {
+                # Skip primary group (Domain Users / SID ending in 513)
+                if ($group.Name -ne 'Domain Users' -and $group.GroupScope -ne 'Primary') {
+                    $removeGroupParams = @{
+                        Identity    = $group.SamAccountName
+                        Members     = $Identity
+                        Confirm     = $false
+                        ErrorAction = 'Stop'
+                    }
+                    if ($Credential) { $removeGroupParams['Credential'] = $Credential }
+                    try {
                         $null = Remove-ADGroupMember @removeGroupParams
                         $removedGroups += $group.Name
+                    }
+                    catch {
+                        $failedGroups += $group.Name
+                        $errors += "Removal from '$($group.Name)' failed: $($_.Exception.Message)"
                     }
                 }
             }
 
             # 3. Disable account
-            $disableParams = @{ Identity = $Identity }
+            $disableParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
             if ($Credential) { $disableParams['Credential'] = $Credential }
-            $null = Disable-ADAccount @disableParams
+            $accountDisabled = $false
+            try {
+                $null = Disable-ADAccount @disableParams
+                $accountDisabled = $true
+            }
+            catch {
+                $errors += "Disable-ADAccount failed: $($_.Exception.Message)"
+            }
 
-            $auditLog = Write-ADAuditLog -Action "Disable-ADUserOffboard" -Target $Identity -Status "Offboarded" -Details @{
+            $status = if (-not $accountDisabled) { "OffboardFailed" } elseif ($errors.Count -gt 0) { "PartiallyOffboarded" } else { "Offboarded" }
+
+            $auditLog = Write-ADAuditLog -Action "Disable-ADUserOffboard" -Target $Identity -Status $status -Details @{
                 GroupsRemoved   = $removedGroups
+                GroupsFailed    = $failedGroups
                 SessionsRevoked = $sessionRevoked
+                AccountDisabled = $accountDisabled
                 ArchiveProfile  = [bool]$ArchiveProfile
+                Errors          = $errors
             } -LogPath $LogPath
 
-            return [PSCustomObject]@{
+            $result = [PSCustomObject]@{
                 Identity        = $Identity
-                Status          = "Offboarded"
+                Status          = $status
                 GroupsRemoved   = $removedGroups
-                SessionsRevoked = [bool]$sessionRevoked
+                GroupsFailed    = $failedGroups
+                SessionsRevoked = $sessionRevoked
+                AccountDisabled = $accountDisabled
                 ProfileArchived = [bool]$ArchiveProfile
+                Errors          = $errors
                 AuditId         = $auditLog.AuditId
             }
+
+            if (-not $accountDisabled) {
+                Write-Error "Offboarding '$Identity' failed: the account is still enabled. $($errors -join ' ')"
+            }
+            elseif ($errors.Count -gt 0) {
+                Write-Warning "Offboarding '$Identity' completed with errors: $($errors -join ' ')"
+            }
+            return $result
         }
         else {
             return [PSCustomObject]@{
                 Identity        = $Identity
                 Status          = "WhatIf-Offboarded"
                 GroupsRemoved   = @()
+                GroupsFailed    = @()
                 SessionsRevoked = $false
+                AccountDisabled = $false
                 ProfileArchived = [bool]$ArchiveProfile
                 AuditId         = "WHATIF-SIMULATED"
             }
@@ -251,7 +340,7 @@ function Set-ADUserRoleAdjustment {
         [string]$NewDepartment = "",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential
@@ -259,7 +348,7 @@ function Set-ADUserRoleAdjustment {
 
     process {
         if ($PSCmdlet.ShouldProcess($Identity, "Adjust user role to '$NewRole' in department '$NewDepartment'")) {
-            $setParams = @{ Identity = $Identity; Title = $NewRole }
+            $setParams = @{ Identity = $Identity; Title = $NewRole; ErrorAction = 'Stop' }
             if (-not [string]::IsNullOrWhiteSpace($NewDepartment)) {
                 $setParams['Department'] = $NewDepartment
             }
@@ -267,20 +356,26 @@ function Set-ADUserRoleAdjustment {
 
             $null = Set-ADUser @setParams
 
-            $targetGroup = "GRP-Domain-Users-Baseline"
+            # Group access only changes with the department: grant the new baseline group, then remove any
+            # other department baseline group so access does not accumulate across transfers.
+            $targetGroup = $null
+            $removedGroups = @()
             if (-not [string]::IsNullOrWhiteSpace($NewDepartment)) {
-                $deptGroupMap = @{
-                    'Engineering'     = 'GRP-ENG-Baseline'
-                    'HR'              = 'GRP-HR-Baseline'
-                    'Finance'         = 'GRP-FIN-Baseline'
-                    'Sales'           = 'GRP-SALES-Baseline'
-                    'IT'              = 'GRP-IT-Baseline'
-                }
-                if ($deptGroupMap.ContainsKey($NewDepartment)) {
-                    $targetGroup = $deptGroupMap[$NewDepartment]
-                    $addGroupParams = @{ Identity = $targetGroup; Members = $Identity }
-                    if ($Credential) { $addGroupParams['Credential'] = $Credential }
-                    $null = Add-ADGroupMember @addGroupParams
+                $targetGroup = Get-DepartmentBaselineGroup -Department $NewDepartment
+                $addGroupParams = @{ Identity = $targetGroup; Members = $Identity; ErrorAction = 'Stop' }
+                if ($Credential) { $addGroupParams['Credential'] = $Credential }
+                $null = Add-ADGroupMember @addGroupParams
+
+                $baselineGroups = @($script:DepartmentGroupMap.Values) + $script:DefaultBaselineGroup
+                $getGroupParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
+                if ($Credential) { $getGroupParams['Credential'] = $Credential }
+                foreach ($group in @(Get-ADPrincipalGroupMembership @getGroupParams)) {
+                    if ($baselineGroups -contains $group.Name -and $group.Name -ne $targetGroup) {
+                        $removeParams = @{ Identity = $group.SamAccountName; Members = $Identity; Confirm = $false; ErrorAction = 'Stop' }
+                        if ($Credential) { $removeParams['Credential'] = $Credential }
+                        $null = Remove-ADGroupMember @removeParams
+                        $removedGroups += $group.Name
+                    }
                 }
             }
 
@@ -288,6 +383,7 @@ function Set-ADUserRoleAdjustment {
                 NewRole       = $NewRole
                 NewDepartment = $NewDepartment
                 GroupAssigned = $targetGroup
+                GroupsRemoved = $removedGroups
             } -LogPath $LogPath
 
             return [PSCustomObject]@{
@@ -295,6 +391,7 @@ function Set-ADUserRoleAdjustment {
                 NewRole       = $NewRole
                 NewDepartment = $NewDepartment
                 GroupAssigned = $targetGroup
+                GroupsRemoved = $removedGroups
                 Status        = "RoleAdjusted"
                 AuditId       = $auditLog.AuditId
             }

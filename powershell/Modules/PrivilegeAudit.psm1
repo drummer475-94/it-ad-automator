@@ -1,5 +1,38 @@
 # PrivilegeAudit.psm1 - Identity hygiene and Tier-0 privilege reporting
 
+function ConvertTo-DistinguishedNameComponent {
+    # Splits a DN into normalized RDNs ("ou=tier 0"), honouring escaped commas such as "CN=Doe\, Jane".
+    param([string]$DistinguishedName)
+
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return @() }
+    return @([regex]::Split($DistinguishedName, '(?<!\\),') |
+        ForEach-Object { ($_.Trim() -replace '^([^=]+?)\s*=\s*', '$1=').ToLowerInvariant() } |
+        Where-Object { $_ })
+}
+
+function Test-DistinguishedNameInContainer {
+    # True when the object's parent path contains the container's RDNs as a contiguous run.
+    # A full container DN (one with DC= components) must match the end of the parent path exactly.
+    param(
+        [string]$DistinguishedName,
+        [string]$Container
+    )
+
+    $parentPath = @(ConvertTo-DistinguishedNameComponent -DistinguishedName $DistinguishedName | Select-Object -Skip 1)
+    $containerPath = @(ConvertTo-DistinguishedNameComponent -DistinguishedName $Container)
+    if ($containerPath.Count -eq 0 -or $containerPath.Count -gt $parentPath.Count) { return $false }
+
+    $containerText = $containerPath -join ','
+    $lastStart = $parentPath.Count - $containerPath.Count
+    $firstStart = if (@($containerPath | Where-Object { $_ -like 'dc=*' }).Count -gt 0) { $lastStart } else { 0 }
+    for ($start = $firstStart; $start -le $lastStart; $start++) {
+        if (($parentPath[$start..($start + $containerPath.Count - 1)] -join ',') -eq $containerText) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Invoke-StaleAccountAudit {
     [CmdletBinding()]
     param(
@@ -8,7 +41,7 @@ function Invoke-StaleAccountAudit {
 
         [string]$OutputPath = "stale_account_audit.json",
 
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [System.Management.Automation.PSCredential]$Credential
     )
@@ -17,17 +50,27 @@ function Invoke-StaleAccountAudit {
         $cutoff = (Get-Date).ToUniversalTime().AddDays(-$InactiveThresholdDays)
         $query = @{
             Filter = '*'
-            Properties = @('Enabled', 'LastLogonDate', 'PasswordNeverExpires', 'DistinguishedName', 'MemberOf')
+            Properties = @('Enabled', 'LastLogonDate', 'PasswordNeverExpires', 'DistinguishedName', 'MemberOf', 'whenCreated')
             ErrorAction = 'Stop'
         }
         if ($Credential) { $query['Credential'] = $Credential }
 
         $findings = foreach ($user in @(Get-ADUser @query)) {
             $reasons = @()
-            if ($user.Enabled -and (-not $user.LastLogonDate -or $user.LastLogonDate.ToUniversalTime() -lt $cutoff)) {
+            # An account that has never logged on is only stale once it is older than the threshold.
+            $isInactive = if ($user.LastLogonDate) {
+                $user.LastLogonDate.ToUniversalTime() -lt $cutoff
+            }
+            else {
+                -not $user.whenCreated -or $user.whenCreated.ToUniversalTime() -lt $cutoff
+            }
+            if ($user.Enabled -and $isInactive) {
                 $reasons += 'InactiveEnabledAccount'
             }
-            if (-not $user.Enabled -and @($user.MemberOf).Count -gt 0) {
+            # Guest (RID 501), krbtgt (502), DefaultAccount (503) and RODC krbtgt_NNNNN accounts are disabled
+            # by design and keep built-in memberships, so they are not offboarding leftovers.
+            $isBuiltInDisabledAccount = ("$($user.SID)" -match '-50[123]$') -or ($user.SamAccountName -match '^krbtgt(_\d+)?$')
+            if (-not $user.Enabled -and -not $isBuiltInDisabledAccount -and @($user.MemberOf).Count -gt 0) {
                 $reasons += 'DisabledAccountRetainsGroups'
             }
             if ($user.PasswordNeverExpires) {
@@ -68,7 +111,7 @@ function Test-DomainAdminHygiene {
 
         [string]$OutputPath = 'domain_admin_hygiene.json',
 
-        [string]$LogPath = 'ad_audit_log.json',
+        [string]$LogPath,
 
         [System.Management.Automation.PSCredential]$Credential
     )
@@ -79,37 +122,48 @@ function Test-DomainAdminHygiene {
         $members = @(Get-ADGroupMember @memberQuery)
         $findings = @()
 
-        foreach ($member in $members) {
-            if ($member.objectClass -eq 'group') {
+        foreach ($member in $members | Where-Object { $_.objectClass -eq 'group' }) {
+            $findings += [PSCustomObject]@{
+                Identity = $member.SamAccountName
+                ObjectClass = $member.objectClass
+                FindingType = 'NestedPrivilegedGroup'
+                Severity = 'High'
+                Recommendation = 'Remove nested membership and grant named, separately managed Tier-0 admin identities.'
+            }
+        }
+
+        # Every effective member - users, computers and service accounts, including those that only hold the
+        # privilege through a nested group - is checked for delegation and Tier-0 placement.
+        $effectiveQuery = @{ Identity = $PrivilegedGroup; Recursive = $true; ErrorAction = 'Stop' }
+        if ($Credential) { $effectiveQuery['Credential'] = $Credential }
+        $effectiveMembers = @(Get-ADGroupMember @effectiveQuery | Where-Object { $_.objectClass -ne 'group' })
+        $directMemberDns = @($members | ForEach-Object { $_.DistinguishedName })
+
+        foreach ($member in $effectiveMembers) {
+            $objectQuery = @{ Identity = $member.DistinguishedName; Properties = @('userAccountControl'); ErrorAction = 'Stop' }
+            if ($Credential) { $objectQuery['Credential'] = $Credential }
+            $principal = Get-ADObject @objectQuery
+            $viaNestedGroup = $directMemberDns -notcontains $member.DistinguishedName
+
+            # 0x80000 = TRUSTED_FOR_DELEGATION (unconstrained Kerberos delegation)
+            if (([int64]$principal.userAccountControl -band 0x80000) -ne 0) {
                 $findings += [PSCustomObject]@{
                     Identity = $member.SamAccountName
-                    FindingType = 'NestedPrivilegedGroup'
-                    Severity = 'High'
-                    Recommendation = 'Remove nested membership and grant named, separately managed Tier-0 admin identities.'
+                    ObjectClass = $member.objectClass
+                    ViaNestedGroup = $viaNestedGroup
+                    FindingType = 'UnconstrainedDelegation'
+                    Severity = 'Critical'
+                    Recommendation = 'Disable unconstrained delegation and migrate to constrained or resource-based constrained delegation.'
                 }
-                continue
             }
-
-            if ($member.objectClass -eq 'user') {
-                $userQuery = @{ Identity = $member.DistinguishedName; Properties = @('TrustedForDelegation', 'DistinguishedName'); ErrorAction = 'Stop' }
-                if ($Credential) { $userQuery['Credential'] = $Credential }
-                $user = Get-ADUser @userQuery
-
-                if ($user.TrustedForDelegation) {
-                    $findings += [PSCustomObject]@{
-                        Identity = $member.SamAccountName
-                        FindingType = 'UnconstrainedDelegation'
-                        Severity = 'Critical'
-                        Recommendation = 'Disable unconstrained delegation and migrate to constrained or resource-based constrained delegation.'
-                    }
-                }
-                if ($user.DistinguishedName -notlike "*$TierZeroOU*") {
-                    $findings += [PSCustomObject]@{
-                        Identity = $member.SamAccountName
-                        FindingType = 'TierZeroSeparationViolation'
-                        Severity = 'High'
-                        Recommendation = 'Move privileged administration to a dedicated Tier-0 identity governed by the Tier-0 OU policy.'
-                    }
+            if (-not (Test-DistinguishedNameInContainer -DistinguishedName $member.DistinguishedName -Container $TierZeroOU)) {
+                $findings += [PSCustomObject]@{
+                    Identity = $member.SamAccountName
+                    ObjectClass = $member.objectClass
+                    ViaNestedGroup = $viaNestedGroup
+                    FindingType = 'TierZeroSeparationViolation'
+                    Severity = 'High'
+                    Recommendation = 'Move privileged administration to a dedicated Tier-0 identity governed by the Tier-0 OU policy.'
                 }
             }
         }
@@ -118,6 +172,7 @@ function Test-DomainAdminHygiene {
             GeneratedAt = (Get-Date).ToUniversalTime().ToString('o')
             PrivilegedGroup = $PrivilegedGroup
             MemberCount = $members.Count
+            EffectiveMemberCount = $effectiveMembers.Count
             FindingCount = $findings.Count
             ComplianceStatus = if ($findings.Count -eq 0) { 'Passed' } else { 'NonCompliant' }
             Findings = $findings
