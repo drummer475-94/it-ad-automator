@@ -100,21 +100,24 @@ function Invoke-ADHealthCheck {
 
         # Step 3: Check tombstone/inactive accounts > Threshold Days
         $inactiveUsers = @()
+        $inactiveSearchSucceeded = $true
         try {
             if ($InactiveAccountSearcher) {
                 $inactiveUsers = @(& $InactiveAccountSearcher $InactiveThresholdDays)
             }
             else {
                 $timeSpan = New-TimeSpan -Days $InactiveThresholdDays
-                $inactiveUsers = Search-ADAccount -AccountInactive -TimeSpan $timeSpan -UserOnly -ErrorAction Stop
+                $inactiveUsers = @(Search-ADAccount -AccountInactive -TimeSpan $timeSpan -UsersOnly -Server $Domain -ErrorAction Stop)
             }
         }
         catch {
-            Write-Verbose "Search-ADAccount call failed or domain unreachable; defaulting to empty list."
+            # A failed search is not evidence of zero inactive accounts; surface it instead of reporting Healthy.
+            $inactiveSearchSucceeded = $false
             $inactiveUsers = @()
+            $findings += "Inactive account search failed; inactive account count is unknown: $($_.Exception.Message)"
         }
 
-        $inactiveCount = if ($inactiveUsers) { $inactiveUsers.Count } else { 0 }
+        $inactiveCount = $inactiveUsers.Count
         if ($inactiveCount -gt 0) {
             $findings += "Found $inactiveCount inactive AD user accounts with no activity in over $InactiveThresholdDays days."
         }
@@ -127,7 +130,7 @@ function Invoke-ADHealthCheck {
         if ($unhealthyDCs -gt 0 -or $offlineSysvols -gt 0) {
             $overallHealth = "Critical"
         }
-        elseif ($inactiveCount -gt 0) {
+        elseif ($inactiveCount -gt 0 -or -not $inactiveSearchSucceeded) {
             $overallHealth = "Warning"
         }
 
@@ -138,12 +141,14 @@ function Invoke-ADHealthCheck {
             DCHealth             = $dcHealth
             SYSVOLStatus         = $sysvolStatus
             InactiveAccountCount = $inactiveCount
+            InactiveSearchStatus = if ($inactiveSearchSucceeded) { "Succeeded" } else { "Failed" }
             Findings             = $findings
         }
 
         # Write audit log entry (suppress output from pipeline)
         $null = Write-ADAuditLog -Action "Invoke-ADHealthCheck" -Target $Domain -Status $overallHealth -Details @{
             InactiveAccountCount = $inactiveCount
+            InactiveSearchStatus = $healthReport.InactiveSearchStatus
             UnhealthyDCs         = $unhealthyDCs
             OfflineSysvols       = $offlineSysvols
         } -LogPath $LogPath

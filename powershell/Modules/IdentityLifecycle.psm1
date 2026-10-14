@@ -61,6 +61,9 @@ function New-ADUserAutomated {
 
         $cleanFirst = $intake.FirstName -replace '[^a-zA-Z0-9]', ''
         $cleanLast  = $intake.LastName  -replace '[^a-zA-Z0-9]', ''
+        if ([string]::IsNullOrEmpty($cleanLast)) {
+            throw "LastName '$($intake.LastName)' contains no ASCII letters or digits; an account name cannot be derived. Create this account manually."
+        }
 
         $upn = "$($cleanFirst.ToLower()).$($cleanLast.ToLower())@$DomainName"
 
@@ -93,6 +96,19 @@ function New-ADUserAutomated {
                 throw "InitialPassword is required for account creation. Pass a SecureString; passwords are never read from intake JSON or stored in source."
             }
 
+            # Refuse to continue when the derived names already belong to someone else; otherwise the
+            # baseline group grant below would land on the existing account.
+            $escapedUpn = $upn -replace "'", "''"
+            $lookupParams = @{
+                Filter      = "SamAccountName -eq '$sam' -or UserPrincipalName -eq '$escapedUpn'"
+                ErrorAction = 'Stop'
+            }
+            if ($Credential) { $lookupParams['Credential'] = $Credential }
+            $existing = @(Get-ADUser @lookupParams)
+            if ($existing.Count -gt 0) {
+                throw "An AD account already uses SamAccountName '$sam' or UserPrincipalName '$upn'. Resolve the naming collision manually; no changes were made."
+            }
+
             $adUserParams = @{
                 SamAccountName     = $sam
                 UserPrincipalName  = $upn
@@ -105,6 +121,7 @@ function New-ADUserAutomated {
                 Path               = $BaseOU
                 Enabled            = $true
                 AccountPassword    = $InitialPassword
+                ErrorAction        = 'Stop'
             }
 
             if ($Credential) {
@@ -116,13 +133,24 @@ function New-ADUserAutomated {
 
             # Assign baseline group
             $groupParams = @{
-                Identity = $baselineGroup
-                Members  = $sam
+                Identity    = $baselineGroup
+                Members     = $sam
+                ErrorAction = 'Stop'
             }
             if ($Credential) {
                 $groupParams['Credential'] = $Credential
             }
-            $null = Add-ADGroupMember @groupParams
+            try {
+                $null = Add-ADGroupMember @groupParams
+            }
+            catch {
+                $null = Write-ADAuditLog -Action "New-ADUserAutomated" -Target $upn -Status "CreatedGroupAssignmentFailed" -Details @{
+                    SamAccountName = $sam
+                    BaselineGroup  = $baselineGroup
+                    Error          = $_.Exception.Message
+                } -LogPath $LogPath
+                throw "Account '$sam' was created but could not be added to '$baselineGroup': $($_.Exception.Message)"
+            }
 
             $auditLog = Write-ADAuditLog -Action "New-ADUserAutomated" -Target $upn -Status "Created" -Details @{
                 SamAccountName = $sam
@@ -177,58 +205,110 @@ function Disable-ADUserOffboard {
 
     process {
         if ($PSCmdlet.ShouldProcess($Identity, "Offboard AD user (revoke sessions, strip security groups, disable account)")) {
-            # 1. Revoke sessions
-            $sessionRevoked = Revoke-ADUserSession -Identity $Identity -RevocationHandler $SessionRevocationHandler
+            # Resolve the account first so a bad identity fails before anything is changed, and so the
+            # cloud session provider receives the UPN rather than an on-premises SamAccountName or DN.
+            $getUserParams = @{ Identity = $Identity; Properties = @('UserPrincipalName'); ErrorAction = 'Stop' }
+            if ($Credential) { $getUserParams['Credential'] = $Credential }
+            $adUser = Get-ADUser @getUserParams
+            $sessionIdentity = if ($adUser.UserPrincipalName) { $adUser.UserPrincipalName } else { $Identity }
+
+            $errors = @()
+
+            # 1. Revoke sessions. A provider failure must not stop the account from being disabled.
+            $sessionRevoked = $false
+            try {
+                $sessionRevoked = [bool](Revoke-ADUserSession -Identity $sessionIdentity -RevocationHandler $SessionRevocationHandler)
+            }
+            catch {
+                $errors += "Session revocation failed: $($_.Exception.Message)"
+            }
 
             # 2. Get group memberships & strip security/distribution groups
-            $getGroupParams = @{ Identity = $Identity }
+            $getGroupParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
             if ($Credential) { $getGroupParams['Credential'] = $Credential }
 
-            $userGroups = Get-ADPrincipalGroupMembership @getGroupParams
-            $removedGroups = @()
+            $userGroups = @()
+            try {
+                $userGroups = @(Get-ADPrincipalGroupMembership @getGroupParams)
+            }
+            catch {
+                $errors += "Group membership lookup failed: $($_.Exception.Message)"
+            }
 
-            if ($userGroups) {
-                foreach ($group in $userGroups) {
-                    # Skip primary group (Domain Users / SID ending in 513)
-                    if ($group.Name -ne 'Domain Users' -and $group.GroupScope -ne 'Primary') {
-                        $removeGroupParams = @{
-                            Identity = $group.SamAccountName
-                            Members  = $Identity
-                            Confirm  = $false
-                        }
-                        if ($Credential) { $removeGroupParams['Credential'] = $Credential }
+            $removedGroups = @()
+            $failedGroups = @()
+            foreach ($group in $userGroups) {
+                # Skip primary group (Domain Users / SID ending in 513)
+                if ($group.Name -ne 'Domain Users' -and $group.GroupScope -ne 'Primary') {
+                    $removeGroupParams = @{
+                        Identity    = $group.SamAccountName
+                        Members     = $Identity
+                        Confirm     = $false
+                        ErrorAction = 'Stop'
+                    }
+                    if ($Credential) { $removeGroupParams['Credential'] = $Credential }
+                    try {
                         $null = Remove-ADGroupMember @removeGroupParams
                         $removedGroups += $group.Name
+                    }
+                    catch {
+                        $failedGroups += $group.Name
+                        $errors += "Removal from '$($group.Name)' failed: $($_.Exception.Message)"
                     }
                 }
             }
 
             # 3. Disable account
-            $disableParams = @{ Identity = $Identity }
+            $disableParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
             if ($Credential) { $disableParams['Credential'] = $Credential }
-            $null = Disable-ADAccount @disableParams
+            $accountDisabled = $false
+            try {
+                $null = Disable-ADAccount @disableParams
+                $accountDisabled = $true
+            }
+            catch {
+                $errors += "Disable-ADAccount failed: $($_.Exception.Message)"
+            }
 
-            $auditLog = Write-ADAuditLog -Action "Disable-ADUserOffboard" -Target $Identity -Status "Offboarded" -Details @{
+            $status = if (-not $accountDisabled) { "OffboardFailed" } elseif ($errors.Count -gt 0) { "PartiallyOffboarded" } else { "Offboarded" }
+
+            $auditLog = Write-ADAuditLog -Action "Disable-ADUserOffboard" -Target $Identity -Status $status -Details @{
                 GroupsRemoved   = $removedGroups
+                GroupsFailed    = $failedGroups
                 SessionsRevoked = $sessionRevoked
+                AccountDisabled = $accountDisabled
                 ArchiveProfile  = [bool]$ArchiveProfile
+                Errors          = $errors
             } -LogPath $LogPath
 
-            return [PSCustomObject]@{
+            $result = [PSCustomObject]@{
                 Identity        = $Identity
-                Status          = "Offboarded"
+                Status          = $status
                 GroupsRemoved   = $removedGroups
-                SessionsRevoked = [bool]$sessionRevoked
+                GroupsFailed    = $failedGroups
+                SessionsRevoked = $sessionRevoked
+                AccountDisabled = $accountDisabled
                 ProfileArchived = [bool]$ArchiveProfile
+                Errors          = $errors
                 AuditId         = $auditLog.AuditId
             }
+
+            if (-not $accountDisabled) {
+                Write-Error "Offboarding '$Identity' failed: the account is still enabled. $($errors -join ' ')"
+            }
+            elseif ($errors.Count -gt 0) {
+                Write-Warning "Offboarding '$Identity' completed with errors: $($errors -join ' ')"
+            }
+            return $result
         }
         else {
             return [PSCustomObject]@{
                 Identity        = $Identity
                 Status          = "WhatIf-Offboarded"
                 GroupsRemoved   = @()
+                GroupsFailed    = @()
                 SessionsRevoked = $false
+                AccountDisabled = $false
                 ProfileArchived = [bool]$ArchiveProfile
                 AuditId         = "WHATIF-SIMULATED"
             }

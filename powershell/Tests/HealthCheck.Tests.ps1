@@ -46,5 +46,33 @@ Describe 'AD Health Check Cmdlets' {
         $report.OverallHealth | Should Be 'Warning'
         $report.InactiveAccountCount | Should Be 2
     }
+
+    It 'queries Search-ADAccount with the real -UsersOnly parameter when no searcher is injected' {
+        Mock -ModuleName HealthCheck Search-ADAccount { @([PSCustomObject]@{ SamAccountName = 'olduser1' }) } -ParameterFilter { $UsersOnly -and $AccountInactive -and $Server -eq 'corp.local' }
+
+        $report = Invoke-ADHealthCheck -DomainControllers @('DC01.corp.local') `
+            -DnsResolver { param($name) [PSCustomObject]@{ IPAddress = '10.0.20.10' } } `
+            -ConnectionTester { param($name) [PSCustomObject]@{ ResponseTime = 4 } } `
+            -PathTester { param($path) $true } `
+            -LogPath (Join-Path $env:TEMP 'ad_test_audit.json')
+
+        $report.InactiveAccountCount | Should Be 1
+        $report.InactiveSearchStatus | Should Be 'Succeeded'
+        $report.OverallHealth | Should Be 'Warning'
+        Assert-MockCalled -ModuleName HealthCheck Search-ADAccount -Exactly 1 -Scope It
+    }
+
+    It 'does not report Healthy when the inactive account search fails' {
+        $report = Invoke-ADHealthCheck -DomainControllers @('DC01.corp.local') `
+            -DnsResolver { param($name) [PSCustomObject]@{ IPAddress = '10.0.20.10' } } `
+            -ConnectionTester { param($name) [PSCustomObject]@{ ResponseTime = 4 } } `
+            -PathTester { param($path) $true } `
+            -InactiveAccountSearcher { param($days) throw 'Unable to contact the server' } `
+            -LogPath (Join-Path $env:TEMP 'ad_test_audit.json')
+
+        $report.OverallHealth | Should Be 'Warning'
+        $report.InactiveSearchStatus | Should Be 'Failed'
+        ($report.Findings -join ' ') | Should Match 'Inactive account search failed'
+    }
 }
 }

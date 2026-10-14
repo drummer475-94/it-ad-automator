@@ -44,7 +44,11 @@ Test-DomainAdminHygiene -TierZeroOU 'OU=Tier 0'
 Get-GPOAuditReport -Domain 'corp.local'
 ```
 
-`Disable-ADUserOffboard` removes non-primary group memberships and disables the account. Session revocation uses `Revoke-MgUserSignInSession` when Microsoft Graph is installed, or a caller-supplied `-SessionRevocationHandler`; the result reports `SessionsRevoked = false` when no provider is configured instead of claiming success.
+`Disable-ADUserOffboard` removes non-primary group memberships and disables the account. Session revocation uses `Revoke-MgUserSignInSession` when Microsoft Graph is installed, or a caller-supplied `-SessionRevocationHandler`; both receive the account's `UserPrincipalName`. The result reports `SessionsRevoked = false` when no provider is configured instead of claiming success. A revocation or group-removal failure does not stop the account from being disabled: the result is `PartiallyOffboarded` with `GroupsFailed` and `Errors` populated, and `OffboardFailed` (plus a PowerShell error) when the account could not be disabled.
+
+`New-ADUserAutomated` refuses to create an account when the derived `SamAccountName` or UPN already exists, so a name collision can never grant the new hire's baseline group to someone else's account.
+
+Audit commands do not report a clean result when they could not look: `Get-GPOAuditReport` returns `ComplianceStatus = Incomplete` with `ScanErrors` when GPOs or SYSVOL cannot be read, and `Invoke-ADHealthCheck` reports `InactiveSearchStatus = Failed` and at least `Warning` when the inactive-account search fails.
 
 ## Safety model
 
@@ -53,7 +57,7 @@ Get-GPOAuditReport -Domain 'corp.local'
 - `SupportsShouldProcess` (`-WhatIf` / `-Confirm`) on lifecycle mutations.
 - JSON intake allowlist validation and sanitized account-name construction.
 - Structured audit and finding exports contain operational metadata, not credentials.
-- Test-only RSAT command shims live under `powershell/Tests` and cannot shadow production AD cmdlets.
+- Test-only RSAT command shims live under `powershell/Tests`, are loaded only by the test suite, and declare the real cmdlets' parameter names so a misspelled parameter fails in tests.
 
 ## Verification
 
@@ -63,7 +67,7 @@ $coverage = 100 * $result.CodeCoverage.NumberOfCommandsExecuted / $result.CodeCo
 'Coverage: {0:N2}%' -f $coverage
 ```
 
-The current suite contains 23 offline-safe tests. CI runs the compatibility suite with Pester 4.10.1 on PowerShell 7, calculates command coverage on every change, and requires greater than 90%.
+The current suite contains 40 offline-safe tests. CI runs the compatibility suite with Pester 4.10.1 on PowerShell 7, calculates command coverage on every change, and requires greater than 90%.
 
 ## License
 
