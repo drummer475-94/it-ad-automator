@@ -1,4 +1,5 @@
 ad_audit_log.json
+ad_audit_log.jsonl
 *_audit_report.json
 stale_account_audit.json
 domain_admin_hygiene.json

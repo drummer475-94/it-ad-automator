@@ -1,6 +1,30 @@
 # IdentityLifecycle.psm1 - Active Directory User Onboarding, Offboarding & Role Adjustments
 # Part of ITADAutomator PowerShell Suite
 
+# Department -> baseline access group. Onboarding and role changes both use this map so a transfer
+# grants exactly what a new hire in that department would get.
+$script:DepartmentGroupMap = @{
+    'Engineering'      = 'GRP-ENG-Baseline'
+    'Software'         = 'GRP-ENG-Baseline'
+    'HR'               = 'GRP-HR-Baseline'
+    'Human Resources'  = 'GRP-HR-Baseline'
+    'Finance'          = 'GRP-FIN-Baseline'
+    'Accounting'       = 'GRP-FIN-Baseline'
+    'Sales'            = 'GRP-SALES-Baseline'
+    'Marketing'        = 'GRP-SALES-Baseline'
+    'IT'               = 'GRP-IT-Baseline'
+}
+$script:DefaultBaselineGroup = 'GRP-Domain-Users-Baseline'
+
+function Get-DepartmentBaselineGroup {
+    param([string]$Department)
+
+    if ($Department -and $script:DepartmentGroupMap.ContainsKey($Department)) {
+        return $script:DepartmentGroupMap[$Department]
+    }
+    return $script:DefaultBaselineGroup
+}
+
 function Revoke-ADUserSession {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -46,7 +70,7 @@ function New-ADUserAutomated {
         [string]$BaseOU = "OU=Users,OU=CORP,DC=corp,DC=local",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential,
@@ -61,35 +85,20 @@ function New-ADUserAutomated {
 
         $cleanFirst = $intake.FirstName -replace '[^a-zA-Z0-9]', ''
         $cleanLast  = $intake.LastName  -replace '[^a-zA-Z0-9]', ''
-        if ([string]::IsNullOrEmpty($cleanLast)) {
-            throw "LastName '$($intake.LastName)' contains no ASCII letters or digits; an account name cannot be derived. Create this account manually."
+        if ([string]::IsNullOrEmpty($cleanFirst) -or [string]::IsNullOrEmpty($cleanLast)) {
+            throw "Name '$($intake.FirstName) $($intake.LastName)' contains no ASCII letters or digits in the first or last name; an account name cannot be derived. Create this account manually."
         }
 
         $upn = "$($cleanFirst.ToLower()).$($cleanLast.ToLower())@$DomainName"
 
-        $firstInitial = if ($cleanFirst.Length -gt 0) { $cleanFirst.Substring(0,1).ToLower() } else { "u" }
+        $firstInitial = $cleanFirst.Substring(0,1).ToLower()
         $sam = "$firstInitial$($cleanLast.ToLower())"
         if ($sam.Length -gt 20) {
             $sam = $sam.Substring(0, 20)
         }
 
         # Determine department baseline group
-        $deptGroupMap = @{
-            'Engineering'      = 'GRP-ENG-Baseline'
-            'Software'         = 'GRP-ENG-Baseline'
-            'HR'               = 'GRP-HR-Baseline'
-            'Human Resources'  = 'GRP-HR-Baseline'
-            'Finance'          = 'GRP-FIN-Baseline'
-            'Accounting'       = 'GRP-FIN-Baseline'
-            'Sales'            = 'GRP-SALES-Baseline'
-            'Marketing'        = 'GRP-SALES-Baseline'
-            'IT'               = 'GRP-IT-Baseline'
-        }
-
-        $baselineGroup = "GRP-Domain-Users-Baseline"
-        if ($deptGroupMap.ContainsKey($intake.Department)) {
-            $baselineGroup = $deptGroupMap[$intake.Department]
-        }
+        $baselineGroup = Get-DepartmentBaselineGroup -Department $intake.Department
 
         if ($PSCmdlet.ShouldProcess($upn, "Create AD User account ($sam) and assign to $baselineGroup")) {
             if (-not $InitialPassword) {
@@ -194,7 +203,7 @@ function Disable-ADUserOffboard {
         [switch]$ArchiveProfile,
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential,
@@ -331,7 +340,7 @@ function Set-ADUserRoleAdjustment {
         [string]$NewDepartment = "",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [System.Management.Automation.PSCredential]$Credential
@@ -339,7 +348,7 @@ function Set-ADUserRoleAdjustment {
 
     process {
         if ($PSCmdlet.ShouldProcess($Identity, "Adjust user role to '$NewRole' in department '$NewDepartment'")) {
-            $setParams = @{ Identity = $Identity; Title = $NewRole }
+            $setParams = @{ Identity = $Identity; Title = $NewRole; ErrorAction = 'Stop' }
             if (-not [string]::IsNullOrWhiteSpace($NewDepartment)) {
                 $setParams['Department'] = $NewDepartment
             }
@@ -347,20 +356,26 @@ function Set-ADUserRoleAdjustment {
 
             $null = Set-ADUser @setParams
 
-            $targetGroup = "GRP-Domain-Users-Baseline"
+            # Group access only changes with the department: grant the new baseline group, then remove any
+            # other department baseline group so access does not accumulate across transfers.
+            $targetGroup = $null
+            $removedGroups = @()
             if (-not [string]::IsNullOrWhiteSpace($NewDepartment)) {
-                $deptGroupMap = @{
-                    'Engineering'     = 'GRP-ENG-Baseline'
-                    'HR'              = 'GRP-HR-Baseline'
-                    'Finance'         = 'GRP-FIN-Baseline'
-                    'Sales'           = 'GRP-SALES-Baseline'
-                    'IT'              = 'GRP-IT-Baseline'
-                }
-                if ($deptGroupMap.ContainsKey($NewDepartment)) {
-                    $targetGroup = $deptGroupMap[$NewDepartment]
-                    $addGroupParams = @{ Identity = $targetGroup; Members = $Identity }
-                    if ($Credential) { $addGroupParams['Credential'] = $Credential }
-                    $null = Add-ADGroupMember @addGroupParams
+                $targetGroup = Get-DepartmentBaselineGroup -Department $NewDepartment
+                $addGroupParams = @{ Identity = $targetGroup; Members = $Identity; ErrorAction = 'Stop' }
+                if ($Credential) { $addGroupParams['Credential'] = $Credential }
+                $null = Add-ADGroupMember @addGroupParams
+
+                $baselineGroups = @($script:DepartmentGroupMap.Values) + $script:DefaultBaselineGroup
+                $getGroupParams = @{ Identity = $Identity; ErrorAction = 'Stop' }
+                if ($Credential) { $getGroupParams['Credential'] = $Credential }
+                foreach ($group in @(Get-ADPrincipalGroupMembership @getGroupParams)) {
+                    if ($baselineGroups -contains $group.Name -and $group.Name -ne $targetGroup) {
+                        $removeParams = @{ Identity = $group.SamAccountName; Members = $Identity; Confirm = $false; ErrorAction = 'Stop' }
+                        if ($Credential) { $removeParams['Credential'] = $Credential }
+                        $null = Remove-ADGroupMember @removeParams
+                        $removedGroups += $group.Name
+                    }
                 }
             }
 
@@ -368,6 +383,7 @@ function Set-ADUserRoleAdjustment {
                 NewRole       = $NewRole
                 NewDepartment = $NewDepartment
                 GroupAssigned = $targetGroup
+                GroupsRemoved = $removedGroups
             } -LogPath $LogPath
 
             return [PSCustomObject]@{
@@ -375,6 +391,7 @@ function Set-ADUserRoleAdjustment {
                 NewRole       = $NewRole
                 NewDepartment = $NewDepartment
                 GroupAssigned = $targetGroup
+                GroupsRemoved = $removedGroups
                 Status        = "RoleAdjusted"
                 AuditId       = $auditLog.AuditId
             }

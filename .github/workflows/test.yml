@@ -21,7 +21,17 @@ jobs:
       - name: Test and enforce greater than 90% command coverage
         shell: pwsh
         run: |
+          # Runner images also ship Pester 5; load the pinned 4.x explicitly so its Should syntax applies.
+          Import-Module Pester -RequiredVersion 4.10.1 -Force
           $result = Invoke-Pester -Path ./powershell/Tests -CodeCoverage ./powershell/Modules/*.psm1 -PassThru
           $coverage = 100 * $result.CodeCoverage.NumberOfCommandsExecuted / $result.CodeCoverage.NumberOfCommandsAnalyzed
           Write-Host ('Command coverage: {0:N2}%' -f $coverage)
+          $summary = @(
+            '### Pester results'
+            ''
+            ('- Pester {0}' -f (Get-Module Pester).Version)
+            ('- Tests: {0} passed, {1} failed' -f $result.PassedCount, $result.FailedCount)
+            ('- Command coverage: {0:N2}% (required: greater than 90%)' -f $coverage)
+          )
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           if ($result.FailedCount -gt 0 -or $coverage -le 90) { exit 1 }

@@ -9,6 +9,7 @@ function global:Get-ADPrincipalGroupMembership { param($Identity, $Credential, $
 function global:Remove-ADGroupMember { param($Identity, $Members, $Confirm, $Credential, $ErrorAction) }
 function global:Add-ADGroupMember { param($Identity, $Members, $Credential, $ErrorAction) }
 function global:Search-ADAccount { param([switch]$AccountInactive, $TimeSpan, [switch]$UsersOnly, $Server, $ErrorAction) }
+function global:Get-ADObject { param($Identity, $Properties, $Filter, $Credential, $ErrorAction) }
 function global:Get-ADGroupMember { param($Identity, [switch]$Recursive, $Credential, $ErrorAction) }
 function global:Get-GPO { param([switch]$All, $Domain, $ErrorAction) }
 function global:Get-GPOReport { param($Guid, $ReportType, $Domain, $ErrorAction) }

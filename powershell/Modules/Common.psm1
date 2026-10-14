@@ -1,6 +1,15 @@
 # Common.psm1 - Shared Helpers, Security & Audit Logging Module
 # Part of ITADAutomator PowerShell Suite
 
+function Get-ADAuditLogDefaultPath {
+    # Audit entries default to one stable per-machine location instead of whatever directory the caller is in.
+    if (-not [string]::IsNullOrWhiteSpace($env:ITAD_AUDIT_LOG_PATH)) {
+        return $env:ITAD_AUDIT_LOG_PATH
+    }
+    $dataRoot = [Environment]::GetFolderPath('LocalApplicationData')
+    return Join-Path -Path (Join-Path -Path $dataRoot -ChildPath 'ITADAutomator') -ChildPath 'ad_audit_log.jsonl'
+}
+
 function Write-ADAuditLog {
     [CmdletBinding()]
     param(
@@ -19,8 +28,9 @@ function Write-ADAuditLog {
         [Parameter(Mandatory = $false)]
         [object]$Details = @{},
 
+        # Defaults to $env:ITAD_AUDIT_LOG_PATH, else <LocalApplicationData>/ITADAutomator/ad_audit_log.jsonl.
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json"
+        [string]$LogPath
     )
 
     process {
@@ -36,24 +46,44 @@ function Write-ADAuditLog {
             Details   = $Details
         }
 
+        if ([string]::IsNullOrWhiteSpace($LogPath)) {
+            $LogPath = Get-ADAuditLogDefaultPath
+        }
+
         try {
-            $existingLogs = @()
-            if (Test-Path -Path $LogPath) {
-                $rawContent = Get-Content -Path $LogPath -Raw -ErrorAction SilentlyContinue
-                if ($rawContent) {
-                    $existingLogs = $rawContent | ConvertFrom-Json
-                    if ($existingLogs -isnot [array]) {
-                        $existingLogs = @($existingLogs)
-                    }
-                }
+            # Resolve relative paths against the PowerShell location, not the process working directory.
+            $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+            $logDirectory = Split-Path -Path $resolvedPath -Parent
+            if ($logDirectory -and -not (Test-Path -LiteralPath $logDirectory)) {
+                $null = New-Item -ItemType Directory -Path $logDirectory -Force -ErrorAction Stop
             }
 
-            $existingLogs += $logEntry
-            $jsonOutput = $existingLogs | ConvertTo-Json -Depth 10
-            Set-Content -Path $LogPath -Value $jsonOutput -Encoding UTF8 -Force
+            # JSON Lines: each entry is appended as one line and earlier entries are never rewritten.
+            $line = ($logEntry | ConvertTo-Json -Depth 10 -Compress) + "`n"
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+
+            # The exclusive write handle serializes concurrent writers; retry briefly while another holds it.
+            $written = $false
+            for ($attempt = 1; $attempt -le 20 -and -not $written; $attempt++) {
+                try {
+                    $stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+                    try {
+                        $stream.Write($bytes, 0, $bytes.Length)
+                        $written = $true
+                    }
+                    finally {
+                        $stream.Dispose()
+                    }
+                }
+                catch [System.IO.IOException] {
+                    if ($attempt -eq 20) { throw }
+                    Start-Sleep -Milliseconds 50
+                }
+            }
         }
         catch {
-            Write-Warning "Failed to write audit log to ${LogPath}: $_"
+            # The caller's action already happened; it must not look audited when it was not.
+            Write-Error "Audit entry $auditId for '$Action' on '$Target' was NOT written to ${LogPath}: $($_.Exception.Message)"
         }
 
         return $logEntry
@@ -109,21 +139,47 @@ function Test-IntakeJsonSchema {
             throw "Intake file at '$IntakeJsonPath' is empty."
         }
 
+        # Check the raw text: PowerShell 7 unwraps a one-element JSON array into a bare object.
+        if (-not $rawJson.TrimStart().StartsWith('{')) {
+            throw "Validation failed: Intake JSON must be a single JSON object."
+        }
         $intakeData = $rawJson | ConvertFrom-Json -ErrorAction Stop
+        if ($intakeData -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Validation failed: Intake JSON must be a single JSON object."
+        }
 
-        $mandatoryFields = @('FirstName', 'LastName', 'Department', 'Manager', 'EmployeeID')
+        # Allowlist: every permitted field, the pattern its value must match, and nothing else.
+        $fieldRules = [ordered]@{
+            FirstName  = "^[\p{L}\p{M}][\p{L}\p{M}' .-]{0,63}$"
+            LastName   = "^[\p{L}\p{M}][\p{L}\p{M}' .-]{0,63}$"
+            Department = '^[\p{L}\p{N}][\p{L}\p{N} &/.-]{0,63}$'
+            Manager    = '^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$'
+            EmployeeID = '^[A-Za-z0-9][A-Za-z0-9-]{0,31}$'
+        }
+
+        $unknownFields = @($intakeData.PSObject.Properties.Name | Where-Object { -not $fieldRules.Contains($_) })
+        if ($unknownFields.Count -gt 0) {
+            throw "Validation failed: Intake JSON contains fields that are not allowed: $($unknownFields -join ', ')"
+        }
+
         $missingFields = @()
-
-        foreach ($field in $mandatoryFields) {
+        $invalidFields = @()
+        foreach ($field in $fieldRules.Keys) {
             $val = $intakeData.$field
-            if ([string]::IsNullOrWhiteSpace($val)) {
+            if ($null -eq $val -or ($val -is [string] -and [string]::IsNullOrWhiteSpace($val))) {
                 $missingFields += $field
+            }
+            elseif ($val -isnot [string] -or $val -notmatch $fieldRules[$field]) {
+                $invalidFields += $field
             }
         }
 
         if ($missingFields.Count -gt 0) {
             $missingStr = $missingFields -join ', '
             throw "Validation failed: Intake JSON is missing mandatory fields: $missingStr"
+        }
+        if ($invalidFields.Count -gt 0) {
+            throw "Validation failed: Intake JSON fields have invalid values: $($invalidFields -join ', '). Manager must be a SamAccountName."
         }
 
         return $intakeData

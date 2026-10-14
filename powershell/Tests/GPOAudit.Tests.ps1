@@ -9,8 +9,8 @@ InModuleScope GPOAudit {
 Describe "GPO Audit Cmdlets" {
 
     Context "Get-GPOAuditReport" {
-        $tempGpoJson = Join-Path $env:TEMP "gpo_test_report.json"
-        $mockSysvolDir = Join-Path $env:TEMP "mock_sysvol"
+        $tempGpoJson = Join-Path $TestDrive "gpo_test_report.json"
+        $mockSysvolDir = Join-Path $TestDrive "mock_sysvol"
 
         Mock -ModuleName GPOAudit Get-GPO {
             return @(
@@ -40,12 +40,13 @@ Describe "GPO Audit Cmdlets" {
         It "Scans GPOs and identifies unlinked GPOs and excessive permissions" {
             $emptySysvol = Join-Path $TestDrive 'empty_sysvol'
             New-Item -ItemType Directory -Path $emptySysvol -Force | Out-Null
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             $report | Should Not Be $null
             $report.Domain | Should Be "corp.local"
             $report.ScannedGPOCount | Should Be 2
-            $report.Findings.Count | Should BeGreaterThan 0
+            @($report.Findings | Where-Object { $_.Category -eq "UnlinkedGPO" }).Count | Should Be 2
+            @($report.Findings | Where-Object { $_.Category -eq "ExcessivePermissions" }).Count | Should Be 2
             $report.ComplianceStatus | Should Be "NonCompliant"
 
             Test-Path $tempGpoJson | Should Be $true
@@ -62,7 +63,7 @@ Describe "GPO Audit Cmdlets" {
 </Groups>
 "@ | Set-Content -Path $groupsXmlPath -Force
 
-            $report = Get-GPOAuditReport -SysvolPath $mockSysvolDir -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -SysvolPath $mockSysvolDir -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             $report.Findings | Should Not Be $null
             $cpassFindings = $report.Findings | Where-Object { $_.Category -eq "CPasswordSecret" }
@@ -78,7 +79,7 @@ Describe "GPO Audit Cmdlets" {
             $emptySysvol = Join-Path $TestDrive 'empty_sysvol'
             New-Item -ItemType Directory -Path $emptySysvol -Force | Out-Null
 
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             $report.ScannedGPOCount | Should Be 0
             $report.ComplianceStatus | Should Be "Incomplete"
@@ -88,7 +89,7 @@ Describe "GPO Audit Cmdlets" {
         It "Reports Incomplete when the SYSVOL path is not accessible" {
             Mock -ModuleName GPOAudit Get-GPO { @() }
 
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath (Join-Path $TestDrive 'missing_sysvol') -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath (Join-Path $TestDrive 'missing_sysvol') -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             $report.ComplianceStatus | Should Be "Incomplete"
             ($report.ScanErrors -join ' ') | Should Match 'not accessible'
@@ -104,7 +105,7 @@ Describe "GPO Audit Cmdlets" {
             $emptySysvol = Join-Path $TestDrive 'empty_sysvol'
             New-Item -ItemType Directory -Path $emptySysvol -Force | Out-Null
 
-            $null = Get-GPOAuditReport -Domain "contoso.com" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $null = Get-GPOAuditReport -Domain "contoso.com" -SysvolPath $emptySysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             Assert-MockCalled -ModuleName GPOAudit Get-GPOReport -Exactly 2 -Scope It -ParameterFilter { $Domain -eq 'contoso.com' }
         }
@@ -128,7 +129,7 @@ Describe "GPO Audit Cmdlets" {
 MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,5
 "@ | Set-Content -Path (Join-Path $sysvol 'GptTmpl.inf')
 
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             @($report.Findings | Where-Object { $_.Category -eq "LegacyProtocolSettings" }).Count | Should Be 0
             $report.ComplianceStatus | Should Be "Passed"
@@ -150,7 +151,7 @@ MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,5
 MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,1
 "@ | Set-Content -Path (Join-Path $sysvol 'GptTmpl.inf')
 
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             $legacy = @($report.Findings | Where-Object { $_.Category -eq "LegacyProtocolSettings" })
             $legacy.Count | Should Be 2
@@ -166,9 +167,26 @@ MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,1
             New-Item -ItemType Directory -Path $sysvol -Force | Out-Null
             "<Groups><User><Properties cpassword='j2A1V3u8N9/1A2B3C4D5E6F7G8H9' userName='localadmin' /></User></Groups>" | Set-Content -Path (Join-Path $sysvol 'Groups.xml')
 
-            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$env:TEMP/ad_test_audit.json"
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath $sysvol -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
 
             @($report.Findings | Where-Object { $_.Category -eq "CPasswordSecret" }).Count | Should Be 1
+        }
+
+        It "Names the owning GPO for SYSVOL findings instead of the leaf folder" {
+            $gpoGuid = [Guid]'31B2F340-016D-11D2-945F-00C04FB984F9'
+            Mock -ModuleName GPOAudit Get-GPO { @([PSCustomObject]@{ DisplayName = "Default Domain Policy"; Id = $gpoGuid }) }
+            Mock -ModuleName GPOAudit Get-GPOReport { '<GPO><LinksTo><SOMPath>corp.local</SOMPath></LinksTo></GPO>' }
+            $groupsDir = Join-Path $TestDrive 'named_sysvol/{31B2F340-016D-11D2-945F-00C04FB984F9}/Machine/Preferences/Groups'
+            New-Item -ItemType Directory -Path $groupsDir -Force | Out-Null
+            '<Groups><User><Properties cpassword="j2A1V3u8N9/1A2B3C4D5E6F7G8H9" userName="localadmin" /></User></Groups>' | Set-Content -Path (Join-Path $groupsDir 'Groups.xml')
+
+            $report = Get-GPOAuditReport -Domain "corp.local" -SysvolPath (Join-Path $TestDrive 'named_sysvol') -OutputPath $tempGpoJson -LogPath "$TestDrive/ad_test_audit.json"
+
+            $finding = @($report.Findings | Where-Object { $_.Category -eq "CPasswordSecret" })
+            $finding.Count | Should Be 1
+            $finding[0].GPOName | Should Be "Default Domain Policy"
+            $finding[0].GPOId | Should Be "31B2F340-016D-11D2-945F-00C04FB984F9"
+            $finding[0].FilePath | Should Match 'Groups\.xml$'
         }
     }
 }

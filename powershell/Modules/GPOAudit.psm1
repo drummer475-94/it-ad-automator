@@ -68,7 +68,7 @@ function Get-GPOAuditReport {
         [string]$OutputPath = "gpo_audit_report.json",
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json"
+        [string]$LogPath
     )
 
     process {
@@ -153,10 +153,17 @@ function Get-GPOAuditReport {
                     $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
                     if (-not $content) { continue }
 
+                    # Policy files live under Policies\{GPO-GUID}\...; name the owning GPO, not the leaf folder.
+                    $guidFolder = $file.FullName -split '[\\/]' | Where-Object { $_ -match '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$' } | Select-Object -Last 1
+                    $fileGpoId = if ($guidFolder) { $guidFolder.Trim('{', '}') } else { $null }
+                    $owningGpo = if ($fileGpoId) { $gpos | Where-Object { "$($_.Id)" -eq $fileGpoId } | Select-Object -First 1 } else { $null }
+                    $fileGpoName = if ($owningGpo) { $owningGpo.DisplayName } elseif ($fileGpoId) { $fileGpoId } else { $file.Directory.Name }
+
                     if ($file.Extension -eq '.xml' -and $content -match 'cpassword\s*=\s*("[^"]+"|''[^'']+'')') {
                         $findings += [PSCustomObject]@{
-                            GPOName     = $file.Directory.Name
-                            GPOId       = $file.FullName
+                            GPOName     = $fileGpoName
+                            GPOId       = $fileGpoId
+                            FilePath    = $file.FullName
                             Category    = "CPasswordSecret"
                             Severity    = "Critical"
                             Description = "Hardcoded MS14-025 cpassword secret detected in Group Policy XML file: $($file.Name)."
@@ -168,8 +175,9 @@ function Get-GPOAuditReport {
                     $legacySettings = @(Get-LegacyProtocolSetting -File $file -Content $content)
                     if ($legacySettings.Count -gt 0) {
                         $findings += [PSCustomObject]@{
-                            GPOName     = $file.Directory.Name
-                            GPOId       = $file.FullName
+                            GPOName     = $fileGpoName
+                            GPOId       = $fileGpoId
+                            FilePath    = $file.FullName
                             Category    = "LegacyProtocolSettings"
                             Severity    = "High"
                             Description = "Legacy protocol settings configured in $($file.Name): $($legacySettings -join '; ')."

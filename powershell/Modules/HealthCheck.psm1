@@ -14,7 +14,7 @@ function Invoke-ADHealthCheck {
         [int]$InactiveThresholdDays = 90,
 
         [Parameter(Mandatory = $false)]
-        [string]$LogPath = "ad_audit_log.json",
+        [string]$LogPath,
 
         [Parameter(Mandatory = $false)]
         [scriptblock]$DnsResolver,
@@ -50,9 +50,15 @@ function Invoke-ADHealthCheck {
 
             try {
                 $conn = if ($ConnectionTester) { & $ConnectionTester $dc } else { Test-Connection -ComputerName $dc -Count 1 -ErrorAction Stop }
-                if ($conn) {
-                    $pingSuccess = $true
-                    $latencyMs = if ($conn.ResponseTime) { $conn.ResponseTime } else { 0 }
+                $reply = @($conn)[0]
+                # PowerShell 7 returns a PingStatus with Status/Latency even when the host is unreachable;
+                # Windows PowerShell returns Win32_PingStatus with StatusCode/ResponseTime.
+                $pingSuccess = if ($null -eq $reply) { $false }
+                    elseif ($null -ne $reply.Status) { "$($reply.Status)" -eq 'Success' }
+                    elseif ($null -ne $reply.StatusCode) { $reply.StatusCode -eq 0 }
+                    else { $true }
+                if ($pingSuccess) {
+                    $latencyMs = if ($null -ne $reply.Latency) { $reply.Latency } elseif ($null -ne $reply.ResponseTime) { $reply.ResponseTime } else { 0 }
                 }
             }
             catch {
